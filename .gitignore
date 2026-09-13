@@ -12,3 +12,7 @@ tokens.sqlite-wal
 
 # Local environment
 .env
+
+# Local module init (repo ships without go.mod by design — README step 2)
+go.mod
+go.sum

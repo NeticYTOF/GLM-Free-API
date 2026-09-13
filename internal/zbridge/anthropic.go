@@ -465,14 +465,14 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     if stream {
-        anthropicStreamResponse(w, prompt, opts, model, requestId, agentToolNames(body.Tools))
+        anthropicStreamResponse(w, prompt, opts, model, requestId)
     } else {
-        anthropicNonStreamResponse(w, prompt, opts, model, requestId, agentToolNames(body.Tools))
+        anthropicNonStreamResponse(w, prompt, opts, model, requestId)
     }
 }
 
 // anthropicStreamResponse converts a ZAIResult stream to Anthropic SSE events.
-func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string, toolNames []string) {
+func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string) {
     w.Header().Set("Content-Type", "text/event-stream")
     w.Header().Set("Cache-Control", "no-cache")
     w.Header().Set("Connection", "keep-alive")
@@ -607,7 +607,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
 
     var interceptor agentInterceptor
     if config.AgentMode {
-        interceptor = newAgentInterceptor(toolNames)
+        interceptor = newAgentInterceptor()
     }
 
     fullContent := ""
@@ -728,14 +728,6 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         for _, tc := range tailCalls {
             emitToolCallEvent(tc)
         }
-
-        // Safety net: fallback tool call extraction at stream end
-        if !toolCallEmitted {
-            toolCalls := agentExtractToolCalls(fullContent, toolNames...)
-            for _, tc := range toolCalls {
-                emitToolCallEvent(tc)
-            }
-        }
     }
 
     stopBlock()
@@ -763,7 +755,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
 }
 
 // anthropicNonStreamResponse produces a single Anthropic message object.
-func anthropicNonStreamResponse(w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string, toolNames []string) {
+func anthropicNonStreamResponse(w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string) {
     ch, err := sendToZAI(prompt, opts)
     if err != nil {
         writeJSON(w, statusFromError(err.Error()), formatAnthropicError("api_error", err.Error()))
@@ -799,9 +791,9 @@ func anthropicNonStreamResponse(w http.ResponseWriter, prompt string, opts SendO
     }
 
     if config.AgentMode {
-        toolCalls := agentExtractToolCalls(fullContent, toolNames...)
+        toolCalls := agentExtractToolCalls(fullContent)
         if len(toolCalls) > 0 {
-            stripped := agentStripToolCalls(fullContent, toolNames...)
+            stripped := agentStripToolCalls(fullContent)
             if stripped != "" {
                 content = append(content, map[string]interface{}{
                     "type": "text",
