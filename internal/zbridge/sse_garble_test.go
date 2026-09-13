@@ -543,7 +543,7 @@ func TestSplitDetails(t *testing.T) {
 		{"<details type=\"thinking\">t</details>ans", "t", "ans"},
 	}
 	for _, c := range cases {
-		r, content := splitDetails(c.raw)
+		r, content, _ := splitDetails(c.raw)
 		if r != c.wantReason || content != c.wantContent {
 			t.Errorf("splitDetails(%q) = (%q, %q), want (%q, %q)",
 				c.raw, r, content, c.wantReason, c.wantContent)

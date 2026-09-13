@@ -184,8 +184,24 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
             }
         }
 
-        initChunk := formatOpenAIResponse(ResponseResult{Content: ""}, model, requestId, true)
-        writeSSE(toJSON(initChunk))
+        // Issue #45: the role/opening chunk must not carry a content key.
+        // An empty-string content delta tells OpenAI clients the answer
+        // has begun — when reasoning follows, clients see a blank content
+        // chunk interrupting the reasoning stream. A delta carrying only
+        // the role is the canonical opener.
+        writeSSE(toJSON(map[string]interface{}{
+            "id":      "chatcmpl-" + requestId,
+            "object":  "chat.completion.chunk",
+            "created": time.Now().Unix(),
+            "model":   model,
+            "choices": []map[string]interface{}{
+                {
+                    "index":         0,
+                    "delta":         map[string]interface{}{"role": "assistant"},
+                    "finish_reason": nil,
+                },
+            },
+        }))
 
         fullContent := ""
         fullReasoning := ""
@@ -223,8 +239,26 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
             for {
                 select {
                 case <-ticker.C:
-                    ka := formatOpenAIResponse(ResponseResult{Content: ""}, model, requestId, true)
-                    writeSSE(toJSON(ka))
+                    // Issue #45: the keep-alive must be INERT. Emitting a
+                    // delta that carries a content key (even an empty
+                    // string) tells OpenAI clients the answer has begun,
+                    // blank-splitting the reasoning accumulation whenever
+                    // the 5s tick lands between two reasoning chunks. A
+                    // delta with NO fields at all keeps proxies and clients
+                    // from timing out without touching either channel.
+                    writeSSE(toJSON(map[string]interface{}{
+                        "id":      "chatcmpl-" + requestId,
+                        "object":  "chat.completion.chunk",
+                        "created": time.Now().Unix(),
+                        "model":   model,
+                        "choices": []map[string]interface{}{
+                            {
+                                "index":         0,
+                                "delta":         map[string]interface{}{},
+                                "finish_reason": nil,
+                            },
+                        },
+                    }))
                 case <-keepAliveStop:
                     return
                 }

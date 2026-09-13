@@ -824,30 +824,39 @@ func (e *sseEmitter) delta(target string) string {
 // from raw: the block bodies (concatenated) become reasoning, everything
 // else becomes content. A trailing opener whose '>' has not arrived yet is
 // held pending (neither reasoning nor content) until more data arrives.
-func splitDetails(raw string) (reasoning, content string) {
+//
+// open reports whether the tail of raw sits inside an UNFINISHED block (an
+// opener — complete or not — whose closing </details> has not arrived
+// yet). While open, the reasoning body is still being written upstream and
+// an edit_content event may rewrite its tail, so the caller keeps the
+// streaming hold-backs. The moment every block is closed the reasoning is
+// settled: it must be released in full, before the answer that follows —
+// holding it until the final flush let the answer overtake the reasoning
+// tail on append-only SSE clients (the reasoning-after-content split from
+// issue #45).
+func splitDetails(raw string) (reasoning, content string, open bool) {
     var rb, cb strings.Builder
     rest := raw
     for {
         idx := strings.Index(rest, "<details")
         if idx < 0 {
             cb.WriteString(rest)
-            break
+            return rb.String(), cb.String(), false
         }
         cb.WriteString(rest[:idx])
         tagEnd := strings.Index(rest[idx:], ">")
         if tagEnd < 0 {
-            break // incomplete opener at the tail — hold pending
+            return rb.String(), cb.String(), true // incomplete opener at the tail — hold pending
         }
         afterTag := rest[idx+tagEnd+1:]
         closeIdx := strings.Index(afterTag, "</details>")
         if closeIdx < 0 {
             rb.WriteString(afterTag) // reasoning still streaming
-            break
+            return rb.String(), cb.String(), true
         }
         rb.WriteString(afterTag[:closeIdx])
         rest = afterTag[closeIdx+len("</details>"):]
     }
-    return rb.String(), cb.String()
 }
 
 // streamSSEResponse parses Z.AI's upstream SSE stream into ZAIResult chunks.
@@ -900,15 +909,17 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult, requestId string) er
     flush := func(final bool) {
         raw := fullText.String()
 
-        // Split <details ...> ... </details> into reasoning vs content
-        reasoning, content := splitDetails(raw)
+        // Split <details ...> ... </details> into reasoning vs content.
+        // reasoningOpen reports whether the reasoning block is still being
+        // written upstream (an opener without its </details> yet).
+        reasoning, content, reasoningOpen := splitDetails(raw)
         if reasoning != "" {
             reasoning = stripDetailsTags(reasoning)
         }
 
         // Emit reasoning delta (prefix-aware, rune-safe). Reasoning rides
-        // the same edit-based stream as content, so while the stream is
-        // live it gets the same protection: hold back a small tail so
+        // the same edit-based stream as content, so while the block is
+        // OPEN it gets the same protection: hold back a small tail so
         // trailing edit_content backtracks are absorbed invisibly, hold
         // back a partial </details> close tag streamed character by
         // character (splitDetails folds it into the reasoning body until
@@ -916,8 +927,11 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult, requestId string) er
         // then rewind the snapshot), and hold back a partially-streamed
         // "> " quote marker that a later character would strip again
         // (non-monotonic snapshots diverge the emitter and duplicate
-        // everything after them). The final flush releases everything.
-        if !final {
+        // everything after them). Once the block CLOSES — or at the final
+        // flush — the reasoning is settled and everything is released:
+        // the answer that follows must never overtake the reasoning tail
+        // on an append-only SSE client (issue #45).
+        if !final && reasoningOpen {
             reasoning = holdBackTail(reasoning, config.StreamHoldback)
             reasoning = holdBackPartialDetailsTag(reasoning)
             reasoning = holdBackPartialQuoteMarker(reasoning)
