@@ -1,10 +1,10 @@
 package zbridge
 
 import (
-    "os"
-    "strconv"
-    "strings"
-    "time"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // ============================================================================
@@ -27,6 +27,26 @@ const (
 // BASE_URL is a var (not const) only so tests can point the bridge at a
 // mock upstream; the default value is the production endpoint.
 var BASE_URL = "https://chat.z.ai"
+
+// ---------- Shared routing port (netics-ai) ----------
+// When ROUTING_URL is set, the bridge routes its Z.AI upstream egress through
+// the shared routing port so Z.AI sees a warmed Tor exit IP instead of the host.
+var routingURL = os.Getenv("ROUTING_URL")
+var routingProvider = os.Getenv("ROUTING_PROVIDER")
+var routingSockHost = os.Getenv("ROUTING_SOCKS_HOST")
+var routingSockPort = os.Getenv("ROUTING_SOCKS_PORT")
+
+func init() {
+	if routingProvider == "" {
+		routingProvider = "glm"
+	}
+	if routingSockHost == "" {
+		routingSockHost = "127.0.0.1"
+	}
+	if routingSockPort == "" {
+		routingSockPort = "9050"
+	}
+}
 
 // ---------- Config struct (Z.AI) ----------
 
