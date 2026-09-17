@@ -262,13 +262,91 @@ func zaiTransport() http.RoundTripper {
 	}
 
 	// If ROUTING_URL is configured, use the shared routing port to dial
-	// Z.AI through the shared Tor exit pool instead of direct.
+	// Z.AI through the shared Tor exit pool instead of direct. Keep-alives
+	// are OFF for routed egress: every chat request dials fresh, so each
+	// request is granted its own exit from the round-robin queue (strict
+	// 1 request = 1 hop). Pooled sockets would pin multiple requests to
+	// one exit and defeat the rotation.
 	if routingURL != "" {
 		transport.DialContext = sharedRoutingDialContext
 		transport.DialTLSContext = sharedRoutingDialTLSContext
+		transport.DisableKeepAlives = true
+		transport.MaxIdleConnsPerHost = 0
 	}
 
 	return newPacedTransport(transport)
+}
+
+// routingExitCtxKey carries a pinned shared-pool exit through a request's
+// context, so every dial that request makes uses the SAME exit (and the WAF
+// cool targets exactly the exit that was blocked, never a neighbor's).
+type routingExitCtxKey struct{}
+
+// routedExit is an exit IP + its Tor circuit credential, pinned for one chat
+// request's whole upstream lifetime.
+type routedExit struct {
+	ip   string
+	cred string
+}
+
+// withRoutingExit returns ctx carrying the pinned exit for this request.
+func withRoutingExit(ctx context.Context, ip, cred string) context.Context {
+	return context.WithValue(ctx, routingExitCtxKey{}, routedExit{ip: ip, cred: cred})
+}
+
+// routingExitFromCtx returns the pinned exit, if the request carries one.
+func routingExitFromCtx(ctx context.Context) (routedExit, bool) {
+	re, ok := ctx.Value(routingExitCtxKey{}).(routedExit)
+	return re, ok && re.cred != ""
+}
+
+// routedConn wraps a Tor-egress socket so its shared-pool slot is released
+// back to the round-robin queue the moment the socket closes — exact
+// grant/release pairing with no handler bookkeeping, so slots can never
+// leak and the queue always rotates.
+type routedConn struct {
+	net.Conn
+	exitIp   string
+	released bool
+	mu       sync.Mutex
+}
+
+func (c *routedConn) Close() error {
+	c.mu.Lock()
+	if !c.released {
+		c.released = true
+		ip := c.exitIp
+		go releaseExitByIp(ip)
+	}
+	c.mu.Unlock()
+	return c.Conn.Close()
+}
+
+// releaseExitByIp hands one exit slot back to the shared pool. Fire-and-forget;
+// the pool treats a release of an already-free slot as a no-op.
+func releaseExitByIp(ip string) {
+	if routingURL == "" || ip == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]interface{}{"exitIp": ip})
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest(http.MethodPost, routingURL+"/routing/release", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	client.Do(req)
+}
+
+// resolveRoutingExit returns the exit this dial must use: the request-pinned
+// one if present, else a fresh grant from the shared pool. The second return
+// is the exit IP for release/cool reporting.
+func resolveRoutingExit(ctx context.Context) (cred, exitIp string, err error) {
+	if re, ok := routingExitFromCtx(ctx); ok {
+		return re.cred, re.ip, nil
+	}
+	pick, perr := fetchRoutingPick()
+	if perr != nil || !pick.OK || pick.Tor.Cred == "" {
+		return "", "", fmt.Errorf("[ROUTING] no exit available from shared pool (routingURL=%q)", routingURL)
+	}
+	return pick.Tor.Cred, pick.ExitIP, nil
 }
 
 // sharedRoutingDialContext routes a plain TCP dial through the shared routing
@@ -277,9 +355,9 @@ func zaiTransport() http.RoundTripper {
 // Z.AI only ever sees Tor — a silent direct dial would leak the host IP and
 // get it WAF-blocked.
 func sharedRoutingDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	creds := routingExitCreds()
-	if creds == "" {
-		return nil, fmt.Errorf("[ROUTING] no exit available from shared pool (routingURL=%q)", routingURL)
+	creds, exitIp, err := resolveRoutingExit(ctx)
+	if err != nil {
+		return nil, err
 	}
 	host, port, _ := net.SplitHostPort(addr)
 	socksAddr := fmt.Sprintf("%s:%s", routingSockHost, routingSockPort)
@@ -289,17 +367,18 @@ func sharedRoutingDialContext(ctx context.Context, network, addr string) (net.Co
 	}
 	if err := socks5Connect(conn, host, port, creds); err != nil {
 		conn.Close()
+		releaseExitByIp(exitIp)
 		return nil, fmt.Errorf("[ROUTING] SOCKS5 connect: %w", err)
 	}
-	return conn, nil
+	return &routedConn{Conn: conn, exitIp: exitIp}, nil
 }
 
 // sharedRoutingDialTLSContext routes a TLS dial through the shared routing
 // port, then runs the uTLS Chrome handshake over the pinned Tor circuit.
 func sharedRoutingDialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	creds := routingExitCreds()
-	if creds == "" {
-		return nil, fmt.Errorf("[ROUTING] no exit available from shared pool (routingURL=%q)", routingURL)
+	creds, exitIp, err := resolveRoutingExit(ctx)
+	if err != nil {
+		return nil, err
 	}
 	host, port, _ := net.SplitHostPort(addr)
 	socksAddr := fmt.Sprintf("%s:%s", routingSockHost, routingSockPort)
@@ -309,13 +388,15 @@ func sharedRoutingDialTLSContext(ctx context.Context, network, addr string) (net
 	}
 	if err := socks5Connect(conn, host, port, creds); err != nil {
 		conn.Close()
+		releaseExitByIp(exitIp)
 		return nil, fmt.Errorf("[ROUTING] SOCKS5 connect: %w", err)
 	}
-	return utls.UClient(conn, &utls.Config{
+	uconn := utls.UClient(conn, &utls.Config{
 		ServerName:         host,
 		NextProtos:         []string{"http/1.1"},
 		InsecureSkipVerify: false,
-	}, utls.HelloChrome_Auto), nil
+	}, utls.HelloChrome_Auto)
+	return &routedConn{Conn: uconn, exitIp: exitIp}, nil
 }
 
 // ============================================================================
@@ -331,9 +412,6 @@ func waitForRoutingExit(timeout time.Duration) error {
 	for {
 		pick, err := fetchRoutingPick()
 		if err == nil && pick.OK && pick.Tor.Cred != "" {
-			// Bust the cached pick so the upcoming guest handshake dials a
-			// fresh grant rather than reusing this probe's slot.
-			routingPickCacheAt = time.Time{}
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -343,54 +421,15 @@ func waitForRoutingExit(timeout time.Duration) error {
 	}
 }
 
-// routingExitCreds returns the SOCKS5 circuit credentials for the current
-// warmed exit IP, as a "<id>:tor" string, or "" when no routing port is
-// configured or the pick is unavailable (direct egress in that case).
-// It also remembers the exit IP so the caller can report it back to the
-// shared pool when the upstream call finishes (round-robin needs the grant
-// to be released or the same exit is handed out forever).
-func routingExitCreds() string {
-	if routingURL == "" {
-		return ""
-	}
-	pick, err := fetchRoutingPick()
-	if err != nil {
-		return ""
-	}
-	if pick.Tor.Cred == "" {
-		return ""
-	}
-	lastRoutingExit = pick.ExitIP
-	return pick.Tor.Cred
-}
-
-// lastRoutingExit is the exit IP the last pick handed out, so the bridge can
-// tell the shared pool when it is done with it (release) or that it was
-// cooled by a WAF block (cool). Round-robin only rotates when the grant is
-// reported back.
-var lastRoutingExit string
-
-// releaseRoutingExit hands the exit back to the shared pool (round-robin
-// advance). No-op when no routing port is configured.
-func releaseRoutingExit() {
-	if routingURL == "" || lastRoutingExit == "" {
-		return
-	}
-	body, _ := json.Marshal(map[string]interface{}{"exitIp": lastRoutingExit})
-	client := &http.Client{Timeout: 2 * time.Second}
-	req, _ := http.NewRequest(http.MethodPost, routingURL+"/routing/release", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	client.Do(req)
-}
-
-// coolRoutingExit tells the shared pool this exit hit a WAF block for
-// retryInMs so it is shelved for that provider and the next pick hops.
-func coolRoutingExit(retryInMs int) {
-	if routingURL == "" || lastRoutingExit == "" {
+// coolRoutingExit tells the shared pool that exitIp hit a WAF block for
+// retryInMs, so it is shelved for that provider and the next pick hops.
+// The socket's own slot is still freed by its Close; cooling only shelves.
+func coolRoutingExit(exitIp string, retryInMs int) {
+	if routingURL == "" || exitIp == "" {
 		return
 	}
 	body, _ := json.Marshal(map[string]interface{}{
-		"exitIp":     lastRoutingExit,
+		"exitIp":     exitIp,
 		"provider":   routingProvider,
 		"retryInMs":  retryInMs,
 		"reason":     "waf_block",
@@ -417,37 +456,25 @@ type routingPickT struct {
 	Reason     string `json:"reason"`
 }
 
-// fetchRoutingPick queries the shared routing port for the current warmed exit
-// for the configured provider (glm by default). Cached briefly so every upstream
-// dial doesn't re-query; the exit hops on cooldown anyway.
-var routingPickCache routingPickT
-var routingPickCacheMu sync.Mutex
-var routingPickCacheAt time.Time
-
+// fetchRoutingPick queries the shared routing port for the next warmed exit
+// for the configured provider (glm by default). EVERY call is a fresh grant
+// that advances the round-robin queue — deliberately never cached, so each
+// dial (and therefore each request) hops to a different exit.
 func fetchRoutingPick() (routingPickT, error) {
-	routingPickCacheMu.Lock()
-	defer routingPickCacheMu.Unlock()
-	if !routingPickCacheAt.IsZero() && time.Since(routingPickCacheAt) < 5*time.Second {
-		return routingPickCache, nil
-	}
 	// Use a plain HTTP client (not the zai one — avoid recursion through the
 	// SOCKS dialer) to reach the local routing port.
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(routingURL + "/routing/pick?provider=" + routingProvider)
 	if err != nil {
-		return routingPickCache, err
+		return routingPickT{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return routingPickCache, fmt.Errorf("routing pick HTTP %d", resp.StatusCode)
+		return routingPickT{}, fmt.Errorf("routing pick HTTP %d", resp.StatusCode)
 	}
 	var p routingPickT
 	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
-		return routingPickCache, err
-	}
-	if p.OK {
-		routingPickCache = p
-		routingPickCacheAt = time.Now()
+		return routingPickT{}, err
 	}
 	return p, nil
 }

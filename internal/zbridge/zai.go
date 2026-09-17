@@ -454,6 +454,19 @@ func sendToZAIStream(prompt string, opts struct {
             return err
         }
 
+        // Pin ONE shared-pool exit for this whole attempt: every dial the
+        // attempt makes egresses through it, and a WAF cool targets exactly
+        // it. The socket's Close frees the slot, so pairing is always exact
+        // and each attempt hops to a different exit (strict round-robin).
+        var routeIp, routeCred string
+        if routingURL != "" {
+            pick, perr := fetchRoutingPick()
+            if perr != nil || !pick.OK || pick.Tor.Cred == "" {
+                return fmt.Errorf("shared pool exhausted, no Tor exit available")
+            }
+            routeIp, routeCred = pick.ExitIP, pick.Tor.Cred
+        }
+
         session.mu.Lock()
         token := session.Token
         userID := session.UserID
@@ -541,6 +554,9 @@ func sendToZAIStream(prompt string, opts struct {
 
         timeout := time.Duration(config.Timeouts.Default) * time.Millisecond * 2
         ctx, cancel := context.WithTimeout(context.Background(), timeout)
+        if routeCred != "" {
+            ctx = withRoutingExit(ctx, routeIp, routeCred)
+        }
         req, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(bodyBytes))
         if err != nil {
             cancel()
@@ -590,10 +606,14 @@ func sendToZAIStream(prompt string, opts struct {
                 log.Println("[DEBUG] Z.AI error body:", string(errBody))
             }
             // Issue #41: the Aliyun WAF block page comes back as 405 with
-            // the block HTML. Detect it, trip the breaker, and surface a
-            // short actionable error instead of the raw 3 KB page.
+            // the block HTML. Cool THIS exit in the shared pool (it leaves
+            // the warm rotation and is replaced) and surface a short
+            // actionable error instead of the raw 3 KB page. The global
+            // breaker is deliberately NOT tripped: other exits are fine,
+            // and the proxy retries this same response on the next exit
+            // immediately.
             if isWAFBlockResponse(resp.StatusCode, errBody) {
-                RecordWAFBlock()
+                coolRoutingExit(routeIp, wafBlockRetryInMs())
                 return fmt.Errorf("%w (retry in ~%s)", ErrWAFBlock, wafRetryHint().Round(time.Second))
             }
             RecordWAFSuccess() // a real API error proves the IP is not blocked
