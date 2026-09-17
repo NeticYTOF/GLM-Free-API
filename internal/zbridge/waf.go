@@ -341,6 +341,20 @@ func wafRetryHint() time.Duration {
     return remaining
 }
 
+// wafBlockRetryInMs returns the current breaker cooldown in milliseconds so
+// the shared pool can shelf the exit for exactly that window. 0 when the
+// breaker is closed (caller should still cool the exit transiently so the
+// next pick does not reuse it immediately).
+func wafBlockRetryInMs() int {
+    return int(wafRetryHint().Milliseconds())
+}
+
+// isWAFError reports whether err is (or wraps) the WAF block error, so the
+// bridge can tell the shared pool to shelf the exit and hop.
+func isWAFError(err error) bool {
+    return err != nil && errors.Is(err, ErrWAFBlock)
+}
+
 // truncateErrorBody keeps non-WAF upstream error bodies short in client-
 // facing messages: a full HTML page helps nobody, and agents choke on it
 // (issue #41). JSON bodies pass through untouched up to a hard cap.

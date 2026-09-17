@@ -179,6 +179,17 @@ func initializeSession() error {
 
     log.Println("[Session] Initializing Z.AI session...")
 
+    // When the shared pool routes our egress, never do the guest handshake
+    // over a bare connection: wait until the proxy's Tor pool hands out an
+    // exit instead of failing into a direct dial.
+    if routingURL != "" {
+        if err := waitForRoutingExit(90 * time.Second); err != nil {
+            log.Printf("[Session] Initialization error: %s", err.Error())
+            session.Initialized = false
+            return err
+        }
+    }
+
     scrapeConfig()
 
     headers := map[string]string{

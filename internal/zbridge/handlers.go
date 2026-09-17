@@ -269,6 +269,10 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         ch, err := sendToZAI(prompt, opts)
         if err != nil {
             log.Printf("[Stream] Error: %s", err.Error())
+            // The exit hit a WAF block (or another upstream failure): tell the
+            // shared pool to shelf it and hop to the next exit on the next
+            // request instead of handing the same one back.
+            if isWAFError(err) { coolRoutingExit(wafBlockRetryInMs()) }
             writeSSE(toJSON(formatOpenAIError(err.Error(), "api_error", statusFromError(err.Error()))))
             writeSSE("[DONE]")
             errored = true
@@ -276,6 +280,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
             for result := range ch {
                 if result.Err != nil {
                     log.Printf("[Stream] Error: %s", result.Err.Error())
+                    if isWAFError(result.Err) { coolRoutingExit(wafBlockRetryInMs()) }
                     writeSSE(toJSON(formatOpenAIError(result.Err.Error(), "api_error", statusFromError(result.Err.Error()))))
                     writeSSE("[DONE]")
                     errored = true
@@ -380,11 +385,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
         close(keepAliveStop)
         wg.Wait()
+        // Success: hand the exit back to the shared pool so round-robin advances
+        // and the next request draws a different exit.
+        releaseRoutingExit()
 
     } else {
         ch, err := sendToZAI(prompt, opts)
         if err != nil {
             log.Printf("[API] Error: %s", err.Error())
+            if isWAFError(err) { coolRoutingExit(wafBlockRetryInMs()) }
             writeJSON(w, statusFromError(err.Error()), formatOpenAIError(err.Error(), "api_error", nil))
             return
         }
@@ -394,6 +403,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         for result := range ch {
             if result.Err != nil {
                 log.Printf("[API] Error: %s", result.Err.Error())
+                if isWAFError(result.Err) { coolRoutingExit(wafBlockRetryInMs()) }
                 writeJSON(w, statusFromError(result.Err.Error()), formatOpenAIError(result.Err.Error(), "api_error", nil))
                 return
             }
@@ -446,6 +456,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         }
 
         writeJSON(w, 200, formatOpenAIResponse(ResponseResult{Content: fullContent, Reasoning: fullReasoning}, model, requestId, false))
+        // Success: hand the exit back so round-robin advances to the next one.
+        releaseRoutingExit()
     }
 }
 func featuresHandler(w http.ResponseWriter, r *http.Request) {

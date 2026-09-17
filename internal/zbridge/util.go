@@ -272,49 +272,45 @@ func zaiTransport() http.RoundTripper {
 }
 
 // sharedRoutingDialContext routes a plain TCP dial through the shared routing
-// port so the upstream sees a warmed Tor exit IP instead of the host.
+// port so the upstream sees a warmed Tor exit IP instead of the host. There is
+// NO direct fallback on failure: the whole point of the shared pool is that
+// Z.AI only ever sees Tor — a silent direct dial would leak the host IP and
+// get it WAF-blocked.
 func sharedRoutingDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	// Ask the routing port for the current warmed exit for this provider
-	// (glm by default). Fall back to direct if the port is unreachable.
 	creds := routingExitCreds()
 	if creds == "" {
-		return (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, network, addr)
+		return nil, fmt.Errorf("[ROUTING] no exit available from shared pool (routingURL=%q)", routingURL)
 	}
-	// Route through the shared Tor SOCKS5 endpoint (127.0.0.1:9050 by default,
-	// matching the proxy's TOR_HOST/TOR_PORT) using the exit's circuit creds.
 	host, port, _ := net.SplitHostPort(addr)
 	socksAddr := fmt.Sprintf("%s:%s", routingSockHost, routingSockPort)
 	conn, err := net.DialTimeout("tcp", socksAddr, 15*time.Second)
 	if err != nil {
-		logInfo("[ROUTING] SOCKS5 dial failed, falling back to direct: " + err.Error())
-		return (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, network, addr)
+		return nil, fmt.Errorf("[ROUTING] SOCKS5 dial %s: %w", socksAddr, err)
 	}
-	// SOCKS5 CONNECT handshake with the exit's circuit credentials
 	if err := socks5Connect(conn, host, port, creds); err != nil {
 		conn.Close()
-		logInfo("[ROUTING] SOCKS5 connect failed, falling back to direct: " + err.Error())
-		return (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, network, addr)
+		return nil, fmt.Errorf("[ROUTING] SOCKS5 connect: %w", err)
 	}
 	return conn, nil
 }
 
-// sharedRoutingDialTLSContext routes a TLS dial through the shared routing port.
+// sharedRoutingDialTLSContext routes a TLS dial through the shared routing
+// port, then runs the uTLS Chrome handshake over the pinned Tor circuit.
 func sharedRoutingDialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	creds := routingExitCreds()
 	if creds == "" {
-		return dialUTLS(ctx, network, addr)
+		return nil, fmt.Errorf("[ROUTING] no exit available from shared pool (routingURL=%q)", routingURL)
 	}
 	host, port, _ := net.SplitHostPort(addr)
 	socksAddr := fmt.Sprintf("%s:%s", routingSockHost, routingSockPort)
 	conn, err := net.DialTimeout("tcp", socksAddr, 15*time.Second)
 	if err != nil {
-		return dialUTLS(ctx, network, addr)
+		return nil, fmt.Errorf("[ROUTING] SOCKS5 dial %s: %w", socksAddr, err)
 	}
 	if err := socks5Connect(conn, host, port, creds); err != nil {
 		conn.Close()
-		return dialUTLS(ctx, network, addr)
+		return nil, fmt.Errorf("[ROUTING] SOCKS5 connect: %w", err)
 	}
-	// TLS handshake over the established tunnel
 	return utls.UClient(conn, &utls.Config{
 		ServerName:         host,
 		NextProtos:         []string{"http/1.1"},
@@ -326,9 +322,33 @@ func sharedRoutingDialTLSContext(ctx context.Context, network, addr string) (net
 // SHARED ROUTING PORT — SOCKS5 exit-IP creds + handshake
 // ============================================================================
 
+// waitForRoutingExit blocks until the shared pool hands out an exit (or the
+// timeout elapses). Used at session bootstrap: the bridge must never do the
+// guest handshake over a direct connection, so instead of failing it waits
+// for the proxy's Tor pool to be warm.
+func waitForRoutingExit(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		pick, err := fetchRoutingPick()
+		if err == nil && pick.OK && pick.Tor.Cred != "" {
+			// Bust the cached pick so the upcoming guest handshake dials a
+			// fresh grant rather than reusing this probe's slot.
+			routingPickCacheAt = time.Time{}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("shared pool gave no exit within %s", timeout)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // routingExitCreds returns the SOCKS5 circuit credentials for the current
 // warmed exit IP, as a "<id>:tor" string, or "" when no routing port is
 // configured or the pick is unavailable (direct egress in that case).
+// It also remembers the exit IP so the caller can report it back to the
+// shared pool when the upstream call finishes (round-robin needs the grant
+// to be released or the same exit is handed out forever).
 func routingExitCreds() string {
 	if routingURL == "" {
 		return ""
@@ -340,7 +360,45 @@ func routingExitCreds() string {
 	if pick.Tor.Cred == "" {
 		return ""
 	}
+	lastRoutingExit = pick.ExitIP
 	return pick.Tor.Cred
+}
+
+// lastRoutingExit is the exit IP the last pick handed out, so the bridge can
+// tell the shared pool when it is done with it (release) or that it was
+// cooled by a WAF block (cool). Round-robin only rotates when the grant is
+// reported back.
+var lastRoutingExit string
+
+// releaseRoutingExit hands the exit back to the shared pool (round-robin
+// advance). No-op when no routing port is configured.
+func releaseRoutingExit() {
+	if routingURL == "" || lastRoutingExit == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]interface{}{"exitIp": lastRoutingExit})
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest(http.MethodPost, routingURL+"/routing/release", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	client.Do(req)
+}
+
+// coolRoutingExit tells the shared pool this exit hit a WAF block for
+// retryInMs so it is shelved for that provider and the next pick hops.
+func coolRoutingExit(retryInMs int) {
+	if routingURL == "" || lastRoutingExit == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"exitIp":     lastRoutingExit,
+		"provider":   routingProvider,
+		"retryInMs":  retryInMs,
+		"reason":     "waf_block",
+	})
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest(http.MethodPost, routingURL+"/routing/cool", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	client.Do(req)
 }
 
 // routingPickT is the shape the shared routing port returns from /routing/pick.
@@ -394,25 +452,63 @@ func fetchRoutingPick() (routingPickT, error) {
 	return p, nil
 }
 
-// socks5Connect performs a minimal SOCKS5 CONNECT handshake (no auth) over the
-// already-established TCP connection to the SOCKS5 proxy, tunneling to
-// host:port. The proxy (Tor) picks a circuit; the exit IP is the one the
-// routing port handed out for this provider.
-func socks5Connect(conn net.Conn, host, port, _ string) error {
-	// Greeting: SOCKS5, no-auth.
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+// socks5Connect performs a SOCKS5 CONNECT handshake with username/password
+// auth over the already-established TCP connection to the SOCKS5 proxy,
+// tunneling to host:port. The username pins a specific Tor circuit (the
+// proxy's agentForId uses "socks://<id>:tor@host:port"), so Z.AI sees the
+// exit IP the shared pool handed out — never the host's real IP.
+func socks5Connect(conn net.Conn, host, port, cred string) error {
+	// Split "id:tor" into username/password. Tor isolates circuits by
+	// username:password pair, which is how the shared pool pins exits.
+	user, pass, ok := strings.Cut(cred, ":")
+	if !ok || user == "" {
+		return fmt.Errorf("socks5 cred malformed (want id:tor)")
+	}
+
+	// Greeting: SOCKS5, offer no-auth (0x00) AND username/password (0x02).
+	if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
 		return fmt.Errorf("socks5 greeting: %w", err)
 	}
-	var resp [2]byte
-	if _, err := io.ReadFull(conn, resp[:]); err != nil {
-		return fmt.Errorf("socks5 reply: %w", err)
+	var gm [2]byte
+	if _, err := io.ReadFull(conn, gm[:]); err != nil {
+		return fmt.Errorf("socks5 greeting reply: %w", err)
 	}
-	if resp[0] != 0x05 || resp[1] != 0x00 {
-		return fmt.Errorf("socks5 no-auth rejected: %v", resp)
+	if gm[0] != 0x05 {
+		return fmt.Errorf("socks5 bad version: %d", gm[0])
 	}
-	// CONNECT request: 0x05 0x01 (connect) 0x00 (reserved) 0x03 (domain)
-	// len(host) host port(high)port(low)
+	switch gm[1] {
+	case 0x00:
+		// Server picked no-auth (Tor won't when auth is offered, but accept it).
+	case 0x02:
+		// Username/password subnegotiation (RFC 1929): VER(1) ULEN UNAME PLEN PASSWD
+		ub, pb := []byte(user), []byte(pass)
+		if len(ub) > 255 || len(pb) > 255 {
+			return fmt.Errorf("socks5 cred too long")
+		}
+		authReq := make([]byte, 0, 3+len(ub)+len(pb))
+		authReq = append(authReq, 0x01, byte(len(ub)))
+		authReq = append(authReq, ub...)
+		authReq = append(authReq, byte(len(pb)))
+		authReq = append(authReq, pb...)
+		if _, err := conn.Write(authReq); err != nil {
+			return fmt.Errorf("socks5 auth write: %w", err)
+		}
+		var ar [2]byte
+		if _, err := io.ReadFull(conn, ar[:]); err != nil {
+			return fmt.Errorf("socks5 auth reply: %w", err)
+		}
+		if ar[1] != 0x00 {
+			return fmt.Errorf("socks5 auth rejected (status %d)", ar[1])
+		}
+	default:
+		return fmt.Errorf("socks5 no acceptable auth method: 0x%02x", gm[1])
+	}
+
+	// CONNECT request: VER CMD RSV ATYP(DOMAIN) LEN HOST PORT
 	hb := []byte(host)
+	if len(hb) > 255 {
+		return fmt.Errorf("socks5 host too long")
+	}
 	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(hb))}
 	req = append(req, hb...)
 	portNum := portToUint16(port)
@@ -420,29 +516,36 @@ func socks5Connect(conn net.Conn, host, port, _ string) error {
 	if _, err := conn.Write(req); err != nil {
 		return fmt.Errorf("socks5 connect request: %w", err)
 	}
-	// Reply: version(1) + replycode(1) + reserved(1) + atyp(1) + addr + port
-	var reply [5]byte
-	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+	// Reply head: VER REP RSV ATYP
+	var rh [4]byte
+	if _, err := io.ReadFull(conn, rh[:]); err != nil {
 		return fmt.Errorf("socks5 connect reply: %w", err)
 	}
-	if reply[1] != 0x00 {
-		return fmt.Errorf("socks5 connect failed: code %d", reply[1])
+	if rh[1] != 0x00 {
+		return fmt.Errorf("socks5 connect failed: code %d", rh[1])
 	}
-	switch reply[3] {
-	case 0x01: // IPv4: 4 bytes addr + 2 port
-		var buf [6]byte
-		_, _ = io.ReadFull(conn, buf[:])
-	case 0x03: // domain: len(1) + domain + 2 port
-		l := int(reply[4])
-		var buf [1]byte
-		if _, err := io.ReadFull(conn, buf[:]); err == nil {
-			l = int(buf[0])
+	// Consume the bound address per ATYP so the stream is exactly at the
+	// payload boundary when the handshake returns.
+	switch rh[3] {
+	case 0x01: // IPv4
+		var buf [6]byte // 4 addr + 2 port
+		if _, err := io.ReadFull(conn, buf[:]); err != nil {
+			return fmt.Errorf("socks5 addr v4: %w", err)
 		}
-		dom := make([]byte, l+2)
-		_, _ = io.ReadFull(conn, dom)
-	case 0x04: // IPv6: 16 bytes addr + 2 port
-		var buf [18]byte
-		_, _ = io.ReadFull(conn, buf[:])
+	case 0x03: // domain: 1 len + n domain + 2 port
+		var lb [1]byte
+		if _, err := io.ReadFull(conn, lb[:]); err != nil {
+			return fmt.Errorf("socks5 addr dom len: %w", err)
+		}
+		dom := make([]byte, int(lb[0])+2)
+		if _, err := io.ReadFull(conn, dom); err != nil {
+			return fmt.Errorf("socks5 addr dom: %w", err)
+		}
+	case 0x04: // IPv6
+		var buf [18]byte // 16 addr + 2 port
+		if _, err := io.ReadFull(conn, buf[:]); err != nil {
+			return fmt.Errorf("socks5 addr v6: %w", err)
+		}
 	}
 	return nil
 }
