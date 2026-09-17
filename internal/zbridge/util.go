@@ -344,8 +344,10 @@ func resolveRoutingExit(ctx context.Context) (cred, exitIp string, err error) {
 	}
 	pick, perr := fetchRoutingPick()
 	if perr != nil || !pick.OK || pick.Tor.Cred == "" {
+		log.Printf("[ROUTING] pick failed (routingURL=%q): %v", routingURL, perr)
 		return "", "", fmt.Errorf("[ROUTING] no exit available from shared pool (routingURL=%q)", routingURL)
 	}
+	log.Printf("[ROUTING] granted exit %s (provider %s)", pick.ExitIP, routingProvider)
 	return pick.Tor.Cred, pick.ExitIP, nil
 }
 
